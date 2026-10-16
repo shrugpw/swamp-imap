@@ -19,11 +19,11 @@ SELECT), so the server itself refuses mutation through the session.
   snapshot resource.
 - `sync` -- fetch message ENVELOPES plus a fixed set of HEADERS ONLY (never
   bodies): From, To, Cc, Subject, Date, Message-ID, In-Reply-To, References,
-  List-ID, List-Unsubscribe, Auto-Submitted, Precedence -- together with flags
-  and size. Writes one `snapshot` resource per folder, each marked
-  `headersOnly: true`. Fans out over multiple folders in one run. Arguments:
-  `folder` (string or string array; defaults to `defaultFolder`), `limit` (cap
-  the most-recent N messages per folder).
+  List-ID, List-Unsubscribe, List-Post, Reply-To, Auto-Submitted, Precedence --
+  together with flags and size. Writes one `snapshot` resource per folder, each
+  marked `headersOnly: true`. Fans out over multiple folders in one run.
+  Arguments: `folder` (string or string array; defaults to `defaultFolder`),
+  `limit` (cap the most-recent N messages per folder).
 - `fetchMessage` -- the one read method that pulls FULL bodies, for a single
   folder per call (an IMAP UID is unique only within one folder + UIDVALIDITY).
   It uses a pre-fetch SIZE GATE: one `{uid, size}` fetch partitions the UID set

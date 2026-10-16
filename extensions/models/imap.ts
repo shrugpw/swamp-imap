@@ -79,8 +79,8 @@
  * Every write method:
  *   - defaults `dryRun` to `true` in its zod schema; `dryRun=true` performs
  *     ZERO server mutation and only computes a `wouldAffect` preview.
- *     `dryRun=false` is the sole mutate path and is operationally
- *     Neil-gated outside this type.
+ *     `dryRun=false` is the sole mutate path and is expected to be
+ *     operationally gated outside this type.
  *   - refuses (throws, no mutation) if a caller-supplied `uidValidity` does
  *     not match the mailbox's live UIDVALIDITY, guarding against mutating a
  *     stale UID selection.
@@ -3402,7 +3402,8 @@ export const model = {
         "connection is made; one invalid keyword aborts the whole run. " +
         "dryRun defaults to true (zero mutation, consolidated wouldAffect-" +
         "shaped preview); dryRun=false is the sole mutate path and is " +
-        "operationally Neil-gated outside this type, same as the P3 methods.",
+        "expected to be operationally gated outside this type, same as the " +
+        "P3 methods.",
       arguments: z.object({
         ontologyModel: z.string().min(1).describe(
           "The @shrug/mail-ontology instance whose latest tagPlan to apply",
