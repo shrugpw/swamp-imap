@@ -1,0 +1,30 @@
+manifestVersion: 1
+name: "@shrug/imap"
+version: "2026.10.14.1"
+description: "Provider-agnostic IMAP inspection + gated-write model built on imapflow. Phase 1 (read-only): listFolders enumerates the folder tree with per-folder message counts and sizes; sync snapshots message envelopes plus a fixed header set (From, To, Cc, Subject, Date, Message-ID, In-Reply-To, References, List-ID, List-Unsubscribe, Auto-Submitted, Precedence) with flags and size into versioned data -- HEADERS ONLY, never bodies. fetchMessage (read-only, EXAMINE) is the one method that pulls FULL bodies, for ONE folder per call (an IMAP UID is unique only within one folder+UIDVALIDITY): it uses a pre-fetch size gate (one {uid,size} fetch to partition the UID set against MAX_BODY_BYTES, then one source fetch for the under-cap UIDs only, never a per-UID loop), decodes with postal-mime, and writes one messageBody record per UID (text/html, attachment metadata only, extracted http/https links, an error field). An over-cap body is deliberately NOT pulled (truncated=true, sourceBytes=server size, null bodies) so oversized sources are never buffered; a no-server-size body over the cap is byte-truncated; each decode is isolated so one malformed message cannot abort the batch; a null-UID or absent UID is skipped. html is stored UNSANITIZED. messageBody records have a FINITE (30d) lifetime. It performs ZERO mutation and is structurally read-only like sync (EXAMINE; no peek knob). Mailboxes are opened read-only (EXAMINE) for these methods. Phase 3 (gated write): addKeywords/removeKeywords/move fan out one STORE/MOVE command over a UID set, dryRun-gated, uidValidity-guarded, verified by a post-mutation re-FETCH. applyTagPlan (Reconcile-B) reads the latest tagPlan record from a @shrug/mail-ontology instance and applies it over the same safety core, fanned out by (folder,keyword) and (folder,destination) group. createFolder (imap-create-folder) ensures a LIST of mailbox paths exist in one call (imapflow mailboxCreate), idempotent on ALREADYEXISTS, verified by a post-creation re-LIST; it is mailbox-level and needs no UID/uidValidity machinery. The mailbox credential is resolved from a swamp vault via CEL; it is never inlined."
+
+license: MIT
+
+repository: https://github.com/shrugpw/swamp-imap
+
+# Resolve typed keys + additionalFiles relative to this manifest's own
+# directory (the repo root), so the paths below are stable wherever the
+# extension root is mounted (standalone repo, submodule, or CI archive).
+paths:
+  base: manifest
+
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+
+models:
+  - extensions/models/imap.ts
+
+# Empty platforms == universal. Talks IMAP over TLS via the imapflow library
+# (no host binaries are shelled out), so it runs anywhere.
+platforms: []
+
+labels:
+  - imap
+  - email
+  - mailbox
