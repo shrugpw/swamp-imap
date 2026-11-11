@@ -8,8 +8,11 @@
  * @module
  */
 import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1";
+import { decodeBase64, encodeBase64 } from "jsr:@std/encoding@1.0.11/base64";
 import { z } from "npm:zod@4";
 import {
+  type AttachmentExtractor,
+  attachmentSlug,
   buildMessageBody,
   checkFetchUidCap,
   checkUidValidity,
@@ -17,6 +20,7 @@ import {
   type DataRecord,
   defaultClientFactory,
   defaultParser,
+  extractAttachment,
   extractLinks,
   type FetchMessage,
   type FetchQuery,
@@ -28,6 +32,7 @@ import {
   type MailboxLock,
   type MailboxOpenResult,
   type MailboxStatus,
+  MAX_ATTACHMENT_BYTES,
   MAX_BODY_BYTES,
   MAX_FETCH_UIDS,
   MAX_FOLDERS,
@@ -36,8 +41,10 @@ import {
   type MimeParser,
   model,
   normalizeAddresses,
+  normalizeAttachmentContent,
   normalizeMessage,
   parseHeaderBlock,
+  sha256Hex,
   SOURCE_NOT_RETURNED,
   sourceByteLength,
   type StatusQuery,
@@ -481,6 +488,7 @@ Deno.test("model exposes the P1 read methods plus the P3 gated-write methods, ap
     "addKeywords",
     "applyTagPlan",
     "createFolder",
+    "fetchAttachment",
     "fetchMessage",
     "listFolders",
     "move",
@@ -3721,4 +3729,469 @@ Deno.test("fetchMessage witnesses an under-cap UID whose source the server did N
     .data as Record<string, unknown>;
   assertEquals(ok.error, null);
   assertEquals(typeof ok.text, "string");
+});
+
+// ---------------------------------------------------------------------------
+// fetchAttachment (read-only attachment BYTES)
+//
+// Reuses the query-aware ScriptedFetchClient (two-fetch size gate, EXAMINE-only,
+// throws from the write seams). All fixtures are depersonalized (RFC 2606
+// reserved domains, synthetic payloads) and every decode runs the REAL
+// postal-mime decoder and REAL @std/encoding base64 on synthetic source.
+// ---------------------------------------------------------------------------
+
+/** Wrap a single-line base64 string into 76-char CRLF lines (RFC 2045). */
+function b64Wrap(s: string): string {
+  return s.replace(/.{1,76}/g, "$&\r\n").trimEnd();
+}
+
+interface SynthAttachment {
+  filename: string;
+  contentType?: string;
+  contentId?: string;
+  bytes: Uint8Array;
+}
+
+/** Build a multipart/mixed message with a text part plus base64 attachments. */
+function mimeWithAttachments(
+  parts: SynthAttachment[],
+  opts: { boundary?: string; text?: string } = {},
+): string {
+  const B = opts.boundary ?? "MIX";
+  const out: string[] = [
+    "From: Carol <carol@example.com>",
+    "To: user@example.net",
+    "Subject: Synthetic attachment",
+    "Message-ID: <synthetic-1@example.com>",
+    `Content-Type: multipart/mixed; boundary="${B}"`,
+    "",
+    `--${B}`,
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    opts.text ?? "Body with attachment.",
+  ];
+  for (const p of parts) {
+    out.push(`--${B}`);
+    out.push(
+      `Content-Type: ${p.contentType ?? "application/octet-stream"}; ` +
+        `name="${p.filename}"`,
+    );
+    out.push(`Content-Disposition: attachment; filename="${p.filename}"`);
+    if (p.contentId) out.push(`Content-ID: <${p.contentId}>`);
+    out.push("Content-Transfer-Encoding: base64");
+    out.push("");
+    out.push(b64Wrap(encodeBase64(p.bytes)));
+  }
+  out.push(`--${B}--`, "");
+  return out.join("\r\n");
+}
+
+/** Build a ScriptedFetchClient + factory for one fetchAttachment call. */
+function attachFactory(
+  fixtures: Record<string, FetchFixtureMessage[]>,
+  uidValidity: number | null = 777,
+): { fake: ScriptedFetchClient; factory: ClientFactory } {
+  const fake = new ScriptedFetchClient(fixtures, uidValidity);
+  return { fake, factory: () => fake };
+}
+
+Deno.test("normalizeAttachmentContent normalizes bytes/ArrayBuffer/string the same way attachmentContentSize counts", () => {
+  assertEquals([...normalizeAttachmentContent(new Uint8Array([1, 2, 3]))], [
+    1,
+    2,
+    3,
+  ]);
+  assertEquals([...normalizeAttachmentContent(new Uint8Array([4, 5]).buffer)], [
+    4,
+    5,
+  ]);
+  // String path (PUB4-PLAN-03): UTF-8 encoded, not UTF-16 code units.
+  assertEquals([...normalizeAttachmentContent("AB")], [65, 66]);
+  assertEquals([...normalizeAttachmentContent("é")], [0xC3, 0xA9]);
+  assertEquals(normalizeAttachmentContent(undefined).length, 0);
+});
+
+Deno.test("sha256Hex returns the lowercase hex SHA-256 of the bytes", async () => {
+  assertEquals(
+    await sha256Hex(new TextEncoder().encode("abc")),
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+  );
+});
+
+Deno.test("extractAttachment selects the named attachment and returns its DECODED bytes and resolved index", async () => {
+  const payload = new TextEncoder().encode("%PDF-1.4 synthetic invoice bytes");
+  const src = mimeWithAttachments([
+    { filename: "invoice.pdf", contentType: "application/pdf", bytes: payload },
+  ]);
+  const match = await extractAttachment(src, { filename: "invoice.pdf" });
+  if (!match.found) throw new Error("expected the attachment to be found");
+  assertEquals(match.filename, "invoice.pdf");
+  assertEquals(match.mimeType, "application/pdf");
+  assertEquals(match.index, 0);
+  assertEquals([...match.content], [...payload]);
+  // A filename that is not present is a clean not-found signal, not a throw.
+  const miss = await extractAttachment(src, { filename: "nope.pdf" });
+  assertEquals(miss.found, false);
+});
+
+Deno.test("fetchAttachment writes one attachment record with exact bytes, sha256, and sizes (EXAMINE read-only)", async () => {
+  const payload = new TextEncoder().encode(
+    "%PDF-1.4 hello invoice " + "x".repeat(100),
+  );
+  const src = mimeWithAttachments([
+    { filename: "invoice.pdf", contentType: "application/pdf", bytes: payload },
+  ]);
+  const { fake, factory } = attachFactory({
+    INBOX: [{ uid: 701, size: sourceByteLength(src), source: src }],
+  });
+  const { context, writes } = makeContext();
+  const result = await model.methods.fetchAttachment.execute(
+    { folder: "INBOX", uid: 701, filename: "invoice.pdf", _client: factory },
+    context,
+  );
+  assertEquals(result.dataHandles.length, 1);
+  assertEquals(writes.length, 1);
+  assertEquals(writes[0].spec, "attachment");
+  assertEquals(
+    writes[0].name,
+    `attachment:INBOX:701:${attachmentSlug("invoice.pdf")}:0`,
+  );
+  const d = writes[0].data as Record<string, unknown>;
+  assertEquals(d.folder, "INBOX");
+  assertEquals(d.uid, 701);
+  assertEquals(d.filename, "invoice.pdf");
+  assertEquals(d.contentType, "application/pdf");
+  assertEquals(d.index, 0);
+  assertEquals(d.size, payload.byteLength);
+  assertEquals(d.sourceBytes, sourceByteLength(src));
+  assertEquals(d.encoding, "base64");
+  assertEquals(d.truncated, false);
+  assertEquals(d.error, null);
+  // Exact byte round-trip through base64, and a matching integrity witness.
+  assertEquals([...decodeBase64(d.content as string)], [...payload]);
+  assertEquals(d.sha256, await sha256Hex(payload));
+  // Read-only invariants: opened EXAMINE, closed, logged out, never a lock.
+  assertEquals(fake.openedReadOnly, [true]);
+  assertEquals(fake.lockCalls, 0);
+  assertEquals(fake.closedCount, 1);
+  assertEquals(fake.loggedOut, true);
+  // The size (first) fetch does NOT ask for source; the source fetch does
+  // (BODY.PEEK[] via source:true).
+  assertEquals(fake.fetchCalls[0].query.source, undefined);
+  assertEquals(fake.fetchCalls[0].query.size, true);
+  assertEquals(sourceFetchCall(fake)?.query.source, true);
+});
+
+Deno.test("fetchAttachment records an error (not a throw) when no attachment matches the filename", async () => {
+  const src = mimeWithAttachments([
+    { filename: "real.pdf", bytes: new TextEncoder().encode("data") },
+  ]);
+  const { fake, factory } = attachFactory({
+    INBOX: [{ uid: 702, size: sourceByteLength(src), source: src }],
+  });
+  const { context, writes } = makeContext();
+  await model.methods.fetchAttachment.execute(
+    { folder: "INBOX", uid: 702, filename: "missing.pdf", _client: factory },
+    context,
+  );
+  assertEquals(writes.length, 1);
+  assertEquals(writes[0].name, "attachment:INBOX:702:missing.pdf:0");
+  const d = writes[0].data as Record<string, unknown>;
+  assertEquals(d.content, null);
+  assertEquals(d.size, null);
+  assertEquals(d.sha256, null);
+  assertEquals(d.truncated, false);
+  assertEquals(d.index, 0);
+  assertEquals((d.error as string).includes("missing.pdf"), true);
+  assertEquals(fake.closedCount, 1);
+});
+
+Deno.test("fetchAttachment isolates a decode throw into an error record (no crash)", async () => {
+  const src = mimeWithAttachments([
+    { filename: "a.pdf", bytes: new TextEncoder().encode("data") },
+  ]);
+  const { factory } = attachFactory({
+    INBOX: [{ uid: 60, size: sourceByteLength(src), source: src }],
+  });
+  const throwing: AttachmentExtractor = () =>
+    Promise.reject(new Error("decode blew up: hostile MIME"));
+  const { context, writes } = makeContext();
+  await model.methods.fetchAttachment.execute(
+    {
+      folder: "INBOX",
+      uid: 60,
+      filename: "a.pdf",
+      _client: factory,
+      _parseAttachment: throwing,
+    },
+    context,
+  );
+  const d = writes[0].data as Record<string, unknown>;
+  assertEquals(d.error, "decode blew up: hostile MIME");
+  assertEquals(d.content, null);
+  assertEquals(d.size, null);
+  assertEquals(d.truncated, false);
+});
+
+Deno.test("fetchAttachment refuses on a uidValidity mismatch and when unverifiable (fail-closed, no read)", async () => {
+  const src = mimeWithAttachments([
+    { filename: "a.pdf", bytes: new TextEncoder().encode("x") },
+  ]);
+  const size = sourceByteLength(src);
+  // Mismatch.
+  const a = attachFactory({ INBOX: [{ uid: 1, size, source: src }] }, 777);
+  const c1 = makeContext();
+  await assertRejects(
+    () =>
+      model.methods.fetchAttachment.execute(
+        {
+          folder: "INBOX",
+          uid: 1,
+          filename: "a.pdf",
+          uidValidity: 999,
+          _client: a.factory,
+        },
+        c1.context,
+      ),
+    Error,
+    "stale selection",
+  );
+  assertEquals(c1.writes.length, 0);
+  assertEquals(a.fake.fetchCalls.length, 0);
+  assertEquals(a.fake.closedCount, 1);
+  assertEquals(a.fake.lockCalls, 0);
+  // Unverifiable (server reports no UIDVALIDITY).
+  const b = attachFactory({ INBOX: [{ uid: 1, size, source: src }] }, null);
+  const c2 = makeContext();
+  await assertRejects(
+    () =>
+      model.methods.fetchAttachment.execute(
+        {
+          folder: "INBOX",
+          uid: 1,
+          filename: "a.pdf",
+          uidValidity: 777,
+          _client: b.factory,
+        },
+        c2.context,
+      ),
+    Error,
+    "did not report a live UIDVALIDITY",
+  );
+  assertEquals(c2.writes.length, 0);
+  assertEquals(b.fake.fetchCalls.length, 0);
+  assertEquals(b.fake.closedCount, 1);
+});
+
+Deno.test("fetchAttachment LAYER 1 withholds an over-cap message by server size and NEVER fetches the source", async () => {
+  const { fake, factory } = attachFactory({
+    INBOX: [{
+      uid: 909,
+      size: MAX_ATTACHMENT_BYTES + 1,
+      source: "SHOULD-NEVER-BE-FETCHED",
+    }],
+  });
+  const { context, writes } = makeContext();
+  await model.methods.fetchAttachment.execute(
+    { folder: "INBOX", uid: 909, filename: "big.pdf", _client: factory },
+    context,
+  );
+  assertEquals(writes.length, 1);
+  const d = writes[0].data as Record<string, unknown>;
+  assertEquals(d.truncated, true);
+  assertEquals(d.content, null);
+  assertEquals(d.size, null);
+  assertEquals(d.sha256, null);
+  assertEquals(d.sourceBytes, MAX_ATTACHMENT_BYTES + 1);
+  assertEquals(d.error, null);
+  assertEquals(d.index, 0);
+  // Load-bearing: exactly ONE fetch occurred and it requested size, not source.
+  assertEquals(fake.fetchCalls.length, 1);
+  assertEquals(fake.fetchCalls[0].query.size, true);
+  assertEquals(fake.fetchCalls[0].query.source, undefined);
+  assertEquals(sourceFetchCall(fake), undefined);
+
+  // A caller-supplied index is used for the withheld record and its key
+  // (the over-cap path never decodes, so no resolved index exists; PUB4-C3-01).
+  const g2 = attachFactory({
+    INBOX: [{ uid: 909, size: MAX_ATTACHMENT_BYTES + 1, source: "X" }],
+  });
+  const c2 = makeContext();
+  await model.methods.fetchAttachment.execute(
+    {
+      folder: "INBOX",
+      uid: 909,
+      filename: "big.pdf",
+      index: 3,
+      _client: g2.factory,
+    },
+    c2.context,
+  );
+  assertEquals((c2.writes[0].data as Record<string, unknown>).index, 3);
+  assertEquals(c2.writes[0].name, "attachment:INBOX:909:big.pdf:3");
+});
+
+Deno.test("fetchAttachment LAYER 2 withholds a no-server-size message whose ACTUAL source exceeds the cap (never decoded)", async () => {
+  const bigSource = new Uint8Array(MAX_ATTACHMENT_BYTES + 1);
+  const { fake, factory } = attachFactory({
+    INBOX: [{ uid: 808, size: undefined, source: bigSource }],
+  });
+  const { context, writes } = makeContext();
+  await model.methods.fetchAttachment.execute(
+    { folder: "INBOX", uid: 808, filename: "big.pdf", _client: factory },
+    context,
+  );
+  // No server size -> Layer 1 passed -> the source fetch WAS issued.
+  assertEquals(sourceFetchCall(fake)?.range, "808");
+  const d = writes[0].data as Record<string, unknown>;
+  assertEquals(d.truncated, true);
+  assertEquals(d.content, null);
+  assertEquals(d.size, null);
+  assertEquals(d.sourceBytes, bigSource.byteLength);
+  assertEquals((d.sourceBytes as number) > MAX_ATTACHMENT_BYTES, true);
+});
+
+Deno.test("fetchAttachment writes DISTINCT records for two attachments of ONE message (no collision)", async () => {
+  const aBytes = new TextEncoder().encode("AAAA aaaa");
+  const bBytes = new TextEncoder().encode("BBBB bbbb bbbb");
+  const src = mimeWithAttachments([
+    { filename: "a.pdf", contentType: "application/pdf", bytes: aBytes },
+    { filename: "b.pdf", contentType: "application/pdf", bytes: bBytes },
+  ]);
+  const size = sourceByteLength(src);
+  const f1 = attachFactory({ INBOX: [{ uid: 55, size, source: src }] });
+  const f2 = attachFactory({ INBOX: [{ uid: 55, size, source: src }] });
+  const { context, writes } = makeContext();
+  await model.methods.fetchAttachment.execute(
+    { folder: "INBOX", uid: 55, filename: "a.pdf", _client: f1.factory },
+    context,
+  );
+  await model.methods.fetchAttachment.execute(
+    { folder: "INBOX", uid: 55, filename: "b.pdf", _client: f2.factory },
+    context,
+  );
+  assertEquals(writes.length, 2);
+  assertEquals(writes.map((w) => w.name).sort(), [
+    "attachment:INBOX:55:a.pdf:0",
+    "attachment:INBOX:55:b.pdf:1",
+  ]);
+  const ra = writes.find((w) => w.name.includes("a.pdf"))!
+    .data as Record<string, unknown>;
+  const rb = writes.find((w) => w.name.includes("b.pdf"))!
+    .data as Record<string, unknown>;
+  assertEquals([...decodeBase64(ra.content as string)], [...aBytes]);
+  assertEquals([...decodeBase64(rb.content as string)], [...bBytes]);
+  assertEquals(ra.index, 0);
+  assertEquals(rb.index, 1);
+});
+
+Deno.test("fetchAttachment disambiguates a repeated filename by index and by contentId", async () => {
+  const first = new TextEncoder().encode("FIRST dup payload");
+  const second = new TextEncoder().encode("SECOND dup payload!!");
+  const src = mimeWithAttachments([
+    { filename: "dup.pdf", bytes: first, contentId: "first@example.com" },
+    { filename: "dup.pdf", bytes: second, contentId: "second@example.com" },
+  ]);
+  const size = sourceByteLength(src);
+  // index 1 resolves to the SECOND attachment.
+  const fIdx = attachFactory({ INBOX: [{ uid: 70, size, source: src }] });
+  const cIdx = makeContext();
+  await model.methods.fetchAttachment.execute(
+    {
+      folder: "INBOX",
+      uid: 70,
+      filename: "dup.pdf",
+      index: 1,
+      _client: fIdx.factory,
+    },
+    cIdx.context,
+  );
+  const d1 = cIdx.writes[0].data as Record<string, unknown>;
+  assertEquals(d1.index, 1);
+  assertEquals(cIdx.writes[0].name, "attachment:INBOX:70:dup.pdf:1");
+  assertEquals([...decodeBase64(d1.content as string)], [...second]);
+  assertEquals(d1.contentId, "<second@example.com>");
+  // contentId resolves to the FIRST attachment (without an index).
+  const fCid = attachFactory({ INBOX: [{ uid: 70, size, source: src }] });
+  const cCid = makeContext();
+  await model.methods.fetchAttachment.execute(
+    {
+      folder: "INBOX",
+      uid: 70,
+      filename: "dup.pdf",
+      contentId: "<first@example.com>",
+      _client: fCid.factory,
+    },
+    cCid.context,
+  );
+  const d0 = cCid.writes[0].data as Record<string, unknown>;
+  assertEquals(d0.index, 0);
+  assertEquals([...decodeBase64(d0.content as string)], [...first]);
+  assertEquals(d0.contentId, "<first@example.com>");
+});
+
+Deno.test("fetchAttachment base64-encodes a multi-MB attachment without overflow and round-trips exactly", async () => {
+  // ~3MB attachment: far over btoa's practical spread-arg limit, under the cap.
+  const big = new Uint8Array(3_000_000);
+  for (let i = 0; i < big.length; i++) big[i] = (i * 31 + 7) & 0xff;
+  const src = mimeWithAttachments([
+    { filename: "big.pdf", contentType: "application/pdf", bytes: big },
+  ]);
+  const size = sourceByteLength(src);
+  // The whole message is under the cap, so it IS decoded (not withheld).
+  assertEquals(size < MAX_ATTACHMENT_BYTES, true);
+  const { factory } = attachFactory({
+    INBOX: [{ uid: 900, size, source: src }],
+  });
+  const { context, writes } = makeContext();
+  await model.methods.fetchAttachment.execute(
+    { folder: "INBOX", uid: 900, filename: "big.pdf", _client: factory },
+    context,
+  );
+  const d = writes[0].data as Record<string, unknown>;
+  assertEquals(d.truncated, false);
+  assertEquals(d.size, big.byteLength);
+  const decoded = decodeBase64(d.content as string);
+  assertEquals(decoded.byteLength, big.byteLength);
+  // Spot-check an exact round-trip at the ends and the middle.
+  assertEquals(decoded[0], big[0]);
+  assertEquals(decoded[1_234_567], big[1_234_567]);
+  assertEquals(decoded[big.length - 1], big[big.length - 1]);
+  assertEquals(d.sha256, await sha256Hex(big));
+});
+
+Deno.test("fetchAttachment records an error when the UID is absent from the folder", async () => {
+  const { fake, factory } = attachFactory({ INBOX: [] });
+  const { context, writes } = makeContext();
+  await model.methods.fetchAttachment.execute(
+    { folder: "INBOX", uid: 404, filename: "x.pdf", _client: factory },
+    context,
+  );
+  assertEquals(writes.length, 1);
+  const d = writes[0].data as Record<string, unknown>;
+  assertEquals(d.content, null);
+  assertEquals(d.size, null);
+  assertEquals((d.error as string).includes("not present"), true);
+  // FETCH 1 ran and yielded nothing; the source fetch was never issued.
+  assertEquals(sourceFetchCall(fake), undefined);
+  assertEquals(fake.closedCount, 1);
+});
+
+Deno.test("fetchAttachment witnesses an under-cap UID whose source the server did NOT return", async () => {
+  const { fake, factory } = attachFactory({
+    INBOX: [{ uid: 505, size: 1000, source: undefined }],
+  });
+  const { context, writes } = makeContext();
+  await model.methods.fetchAttachment.execute(
+    { folder: "INBOX", uid: 505, filename: "x.pdf", _client: factory },
+    context,
+  );
+  const d = writes[0].data as Record<string, unknown>;
+  assertEquals(d.error, SOURCE_NOT_RETURNED);
+  assertEquals(d.content, null);
+  assertEquals(d.size, null);
+  assertEquals(d.truncated, false);
+  assertEquals(d.sourceBytes, 1000);
+  // The source fetch WAS attempted (under cap) but returned nothing.
+  assertEquals(sourceFetchCall(fake)?.range, "505");
 });

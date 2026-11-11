@@ -161,6 +161,12 @@
 import { z } from "npm:zod@4";
 import { ImapFlow } from "npm:imapflow@2.2.1";
 import PostalMime from "npm:postal-mime@2.7.2";
+// Chunk-safe base64 encoder for the decoded attachment bytes `fetchAttachment`
+// returns: `btoa(String.fromCharCode(...bytes))` stack-overflows on the
+// multi-MB PDFs this method targets, so a real streaming codec is required.
+// Pinned per repo rule 7 (no deno.json/deno.lock here, so the pin lives inline
+// at the import site). sha256 uses the built-in Web Crypto global, NOT a dep.
+import { encodeBase64 } from "jsr:@std/encoding@1.0.11/base64";
 
 // ---------------------------------------------------------------------------
 // Global arguments (connection + vaulted credential)
@@ -309,6 +315,70 @@ const MessageBodySchema = MessageSchema.extend({
 
 /** A decoded full-body message record. */
 export type MessageBody = z.infer<typeof MessageBodySchema>;
+
+/**
+ * One message's single decoded attachment, produced by `fetchAttachment`. Unlike
+ * {@link AttachmentSchema} (metadata only, used by fetchMessage), this record
+ * carries the attachment BYTES as a base64 string plus an integrity witness.
+ *
+ * `size` is ONLY ever the DECODED attachment byte length on success and is null
+ * on every withheld/error path -- it is NEVER the whole-message size. The
+ * separate `sourceBytes` field carries the whole-message byte count (the
+ * server's RFC822.SIZE on the Layer-1 over-cap path, or the actual fetched
+ * source length on the Layer-2 path) so a withheld record never conflates the
+ * two. `content`/`sha256` are null whenever the bytes were withheld (either cap
+ * layer) or no attachment matched; `truncated` is true ONLY when a size cap
+ * withheld the bytes. Records have a FINITE lifetime so third-party attachment
+ * bytes do not persist forever.
+ */
+const AttachmentBytesSchema = z.object({
+  folder: z.string(),
+  uid: z.number().int(),
+  filename: z.string().describe("The requested attachment filename"),
+  contentType: z.string().nullable(),
+  contentId: z.string().nullable(),
+  index: z.number().int().describe(
+    "Zero-based position of the attachment among the message's attachments; " +
+      "on a withheld/not-found path (never decoded) it is the caller-supplied " +
+      "index or 0. Part of the per-attachment write key so two attachments of " +
+      "one message never collide.",
+  ),
+  size: z.number().int().nullable().describe(
+    "DECODED attachment byte length on success; null when the bytes were " +
+      "withheld (over cap) or no attachment matched. NEVER the whole-message " +
+      "size (that is sourceBytes).",
+  ),
+  sourceBytes: z.number().int().describe(
+    "The whole-message raw source byte count -- the server's RFC822.SIZE on " +
+      "the Layer-1 over-cap path, else the actual fetched source length -- " +
+      "recorded even when the attachment is withheld so the decision is never " +
+      "silent.",
+  ),
+  sha256: z.string().nullable().describe(
+    "Lowercase hex SHA-256 over the DECODED attachment bytes (Web Crypto); " +
+      "null when withheld or not found.",
+  ),
+  encoding: z.literal("base64").describe("Encoding of the content field"),
+  content: z.string().nullable().describe(
+    "base64 of the DECODED attachment bytes; null when withheld (either cap " +
+      "layer) or no attachment matched the selector.",
+  ),
+  truncated: z.boolean().describe(
+    "true ONLY when a size cap WITHHELD the bytes (a MIME attachment cannot " +
+      "be byte-truncated and still decoded): either the server's RFC822.SIZE " +
+      "exceeded MAX_ATTACHMENT_BYTES (Layer 1, bytes never fetched) or the " +
+      "actual source exceeded it (Layer 2, no-size path). false otherwise.",
+  ),
+  error: z.string().nullable().describe(
+    "Set when the UID was absent, the source was not returned, no attachment " +
+      "matched, or decoding threw; null on a clean success or a clean " +
+      "over-cap withhold.",
+  ),
+  retrievedAt: z.iso.datetime(),
+});
+
+/** One message's single decoded attachment with bytes. */
+export type AttachmentBytes = z.infer<typeof AttachmentBytesSchema>;
 
 /** One folder's descriptor plus its message count and total size. */
 const FolderSchema = z.object({
@@ -962,6 +1032,19 @@ export function folderSlug(folder: string): string {
 }
 
 /**
+ * Encode an attachment filename into a collision-free resource instance slug,
+ * using the SAME injective percent-escape as {@link folderSlug}. Keeps the
+ * `fetchAttachment` write key filesystem-safe so two attachments of one message
+ * with different filenames can never produce the same key.
+ *
+ * @param filename The attachment filename.
+ * @returns A filesystem-safe, collision-free slug.
+ */
+export function attachmentSlug(filename: string): string {
+  return folderSlug(filename);
+}
+
+/**
  * Coerce an imapflow flags value (Set or array) to a plain string array.
  *
  * @param v Flags as a Set, array, or absent.
@@ -1120,6 +1203,121 @@ export const defaultParser: MimeParser = async (source) => {
     text: email.text ?? null,
     html: email.html ?? null,
     attachments,
+  };
+};
+
+/**
+ * Normalize a postal-mime attachment `content` value to a `Uint8Array`, using
+ * the SAME shape handling as {@link attachmentContentSize} (ArrayBuffer and
+ * Uint8Array pass through as their bytes; a string is UTF-8 encoded) so the
+ * reported `size`, the sha256 witness, and the base64 content all round-trip
+ * consistently. An absent content yields an empty array.
+ *
+ * @param content The decoded attachment content from postal-mime.
+ * @returns The content as raw bytes.
+ */
+export function normalizeAttachmentContent(
+  content: ArrayBuffer | Uint8Array | string | undefined,
+): Uint8Array {
+  if (content === undefined) return new Uint8Array(0);
+  if (typeof content === "string") return new TextEncoder().encode(content);
+  if (content instanceof Uint8Array) return content;
+  return new Uint8Array(content);
+}
+
+/** Lowercase hex SHA-256 over the given bytes via the Web Crypto global. */
+export async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Selects ONE attachment out of a decoded message. `filename` is required; an
+ * optional `contentId` and/or zero-based `index` (position among the message's
+ * attachments) disambiguate when a filename repeats. The first attachment
+ * matching every supplied field (in message order) is chosen.
+ */
+export interface AttachmentSelector {
+  filename: string;
+  contentId?: string | null;
+  index?: number;
+}
+
+/**
+ * The result of {@link extractAttachment}: either the matched attachment with
+ * its DECODED bytes and resolved zero-based index, or a not-found signal.
+ */
+export type AttachmentExtract =
+  | {
+    found: true;
+    filename: string | null;
+    mimeType: string | null;
+    contentId: string | null;
+    index: number;
+    content: Uint8Array;
+  }
+  | { found: false };
+
+/**
+ * A pure, injectable attachment decoder: raw RFC822 source + a selector in, the
+ * matched attachment's DECODED bytes out. Injected into `fetchAttachment` via
+ * the hidden `_parseAttachment` seam (parallel to `_parse` on fetchMessage) so
+ * unit tests feed synthetic source and execute the REAL postal-mime decoder
+ * with no network and no live mail.
+ */
+export type AttachmentExtractor = (
+  source: Uint8Array | string,
+  selector: AttachmentSelector,
+) => Promise<AttachmentExtract>;
+
+/**
+ * The default attachment decoder: a thin wrapper over postal-mime's static
+ * `PostalMime.parse` that, unlike {@link defaultParser} (which DROPS content),
+ * RETAINS the selected attachment's bytes. It normalizes the chosen
+ * attachment's content exactly like {@link attachmentContentSize} /
+ * {@link normalizeAttachmentContent} so `size`, sha256, and base64 agree. Pure
+ * with respect to the model: no network, no mailbox state.
+ *
+ * @param source The raw RFC822 message source (string or bytes).
+ * @param selector Which attachment to return.
+ * @returns The matched attachment with bytes, or a not-found signal.
+ */
+export const extractAttachment: AttachmentExtractor = async (
+  source,
+  selector,
+) => {
+  const email = await PostalMime.parse(source) as {
+    attachments?: Array<{
+      filename?: string | null;
+      mimeType?: string | null;
+      contentId?: string | null;
+      content?: ArrayBuffer | Uint8Array | string;
+    }>;
+  };
+  const atts = email.attachments ?? [];
+  let chosen = -1;
+  for (let i = 0; i < atts.length; i++) {
+    const a = atts[i];
+    if ((a.filename ?? null) !== selector.filename) continue;
+    if (
+      selector.contentId != null &&
+      (a.contentId ?? null) !== selector.contentId
+    ) continue;
+    if (selector.index != null && i !== selector.index) continue;
+    chosen = i;
+    break;
+  }
+  if (chosen === -1) return { found: false };
+  const a = atts[chosen];
+  return {
+    found: true,
+    filename: a.filename ?? null,
+    mimeType: a.mimeType ?? null,
+    contentId: a.contentId ?? null,
+    index: chosen,
+    content: normalizeAttachmentContent(a.content),
   };
 };
 
@@ -1465,6 +1663,26 @@ export const MAX_FETCH_UIDS = 25;
  * blowing up the run or bloating the store with an unbounded body.
  */
 export const MAX_BODY_BYTES = 1_000_000;
+
+/**
+ * Whole-MESSAGE raw-source byte cap for {@link model.methods.fetchAttachment}.
+ * A DEDICATED cap (NOT the 1MB {@link MAX_BODY_BYTES}, which would withhold the
+ * very invoice PDFs fetchAttachment exists to deliver): real invoice PDFs run
+ * 1-5MB+, and 25MB is a common provider attachment ceiling that still bounds
+ * the buffered message source against OOM/DoS.
+ *
+ * IMPORTANT: this gates the WHOLE-MESSAGE size (RFC822.SIZE in Layer 1,
+ * `sourceByteLength(source)` in Layer 2), NOT a single attachment. Because the
+ * delivered attachment is a base64-encoded MIME part inside the message source,
+ * the largest DECODED attachment this method can return is strictly smaller
+ * than the cap (roughly cap/1.33 minus sibling MIME parts). The property this
+ * bound guarantees is "never buffer a message source larger than this"; it is
+ * not a promise of a 25MB deliverable attachment. (A successful delivery also
+ * stores the base64 content -- ~1.33x the decoded bytes -- in one data record,
+ * so the cap must be chosen against the datastore's per-record limit too; for
+ * the 1-5MB invoice-PDF domain this is comfortable.)
+ */
+export const MAX_ATTACHMENT_BYTES = 25_000_000;
 
 /**
  * Enforce the {@link MAX_FETCH_UIDS} cap on a (de-duplicated) UID set.
@@ -2325,7 +2543,7 @@ function foldersArg(
 /** Provider-agnostic IMAP inspection (read-only) + gated write model. */
 export const model = {
   type: "@shrug/imap",
-  version: "2026.10.14.1",
+  version: "2026.11.10.1",
   description:
     "Provider-agnostic IMAP over imapflow: read-only listFolders/sync " +
     "(EXAMINE; folder tree + header/envelope-only snapshots, no bodies) and " +
@@ -2335,7 +2553,15 @@ export const model = {
     "A pre-fetch size gate (one {uid,size} fetch then one source fetch for " +
     "under-cap UIDs) withholds over-cap bodies (truncated=true, never " +
     "buffered); each decode is isolated so one bad message cannot abort the " +
-    "batch; records have a FINITE lifetime. html is stored UNSANITIZED. Plus " +
+    "batch; records have a FINITE lifetime. html is stored UNSANITIZED. " +
+    "read-only fetchAttachment (EXAMINE + BODY.PEEK[]) is the ONE method that " +
+    "returns attachment CONTENT: it pulls ONE named attachment of ONE message " +
+    "by UID into an `attachment` record (base64 bytes + sha256 witness + " +
+    "decoded/source byte sizes), using the SAME two byte-bound layers against " +
+    "a dedicated whole-message MAX_ATTACHMENT_BYTES cap (pre-fetch size gate " +
+    "AND post-decode source-byte cap) and WITHHOLDING (not truncating) an " +
+    "over-cap attachment; its per-(folder,uid,filename,index) key keeps two " +
+    "attachments of one message from colliding; FINITE lifetime. Plus " +
     "gated write methods addKeywords/removeKeywords/move/applyTagPlan/" +
     "createFolder. dryRun defaults true and is the only non-mutating path; " +
     "previews open EXAMINE (read-only), mutations open read-write via " +
@@ -2372,6 +2598,19 @@ export const model = {
       schema: MessageBodySchema,
       // Bounded TTL (not "infinite"): full third-party body content is
       // sensitive and should age out. 30 days is a sensible triage window.
+      lifetime: "30d",
+      garbageCollection: 20,
+    },
+    "attachment": {
+      description: "One message's single decoded attachment BYTES by " +
+        "(folder,uid,filename,index) (fetchAttachment): base64 content plus a " +
+        "sha256 witness and byte sizes on success, or a withheld (over-cap) / " +
+        "not-found / error record. Strictly read-only (EXAMINE + BODY.PEEK[]). " +
+        "FINITE lifetime (30d) so third-party attachment bytes do not persist " +
+        "forever.",
+      schema: AttachmentBytesSchema,
+      // Bounded TTL, same rationale as messageBody: third-party attachment
+      // bytes are sensitive and should age out.
       lifetime: "30d",
       garbageCollection: 20,
     },
@@ -2743,6 +2982,242 @@ export const model = {
             await client.mailboxClose();
           }
           return { dataHandles: handles };
+        } finally {
+          await client.logout();
+        }
+      },
+    },
+    fetchAttachment: {
+      description:
+        "Fetch and DECODE the BYTES of ONE named attachment of ONE message by " +
+        "UID in ONE folder, writing a single `attachment` record (base64 " +
+        "content + sha256 witness + decoded/source byte sizes). This is the " +
+        "ONLY method that returns attachment CONTENT -- fetchMessage keeps " +
+        "attachment METADATA only. STRICTLY READ-ONLY: opens the folder " +
+        "read-only (EXAMINE) exactly like fetchMessage and ALWAYS closes it, " +
+        "pulls the source via BODY.PEEK[] (never sets \\Seen; there is no peek " +
+        "knob to disable -- EXAMINE guarantees the server refuses mutation), " +
+        "and NEVER locks/flags/moves/deletes. Performs ZERO server mutation " +
+        "(not dryRun-gated). Reuses the fail-closed uidValidity guard " +
+        "(unverifiable == mismatch == refuse, no read). Adopts BOTH of " +
+        "fetchMessage's byte-bound layers against MAX_ATTACHMENT_BYTES (a " +
+        "dedicated WHOLE-MESSAGE cap, NOT the 1MB body cap): LAYER 1 is a " +
+        "pre-fetch size gate -- one {uid,size} fetch with NO source; if the " +
+        "server's RFC822.SIZE is over the cap the source is NEVER fetched and " +
+        "the record is withheld (truncated=true, content/size/sha256 null, " +
+        "sourceBytes=server size). LAYER 2 handles a message the server " +
+        "reports NO size for: it passes Layer 1 into one source fetch, and if " +
+        "the ACTUAL source byte length is over the cap the attachment is " +
+        "WITHHELD (truncated=true) rather than decoded -- a MIME attachment " +
+        "cannot be byte-truncated and still decoded. Only an UNDER-cap message " +
+        "is decoded with postal-mime; the named attachment is selected " +
+        "(optional contentId/index disambiguate a repeated filename), its " +
+        "bytes base64-encoded and sha256-witnessed, and written under a " +
+        "per-(folder,uid,filename,index) key so two attachments of one " +
+        "message never collide. A UID absent from the folder, a source the " +
+        "server did not return, a filename matching no attachment, or a decode " +
+        "throw is recorded as an error record (not a crash). `attachment` " +
+        "records have a FINITE lifetime so third-party bytes do not persist " +
+        "indefinitely.",
+      arguments: z.object({
+        folder: z.string().min(1).describe(
+          "The ONE folder the message lives in (e.g. a sync snapshot:<folder>)",
+        ),
+        uid: z.number().int().positive().describe(
+          "The single UID of the message carrying the attachment",
+        ),
+        filename: z.string().min(1).describe(
+          "The attachment filename to return (as decoded by postal-mime)",
+        ),
+        contentId: z.string().min(1).optional().describe(
+          "Optional Content-ID to disambiguate a repeated filename",
+        ),
+        index: z.number().int().nonnegative().optional().describe(
+          "Optional zero-based position among the message's attachments to " +
+            "disambiguate a repeated filename; also the recorded index on a " +
+            "withheld/not-found path (where nothing is decoded)",
+        ),
+        uidValidity: z.number().int().positive().optional().describe(
+          "If given, must match the folder's live UIDVALIDITY or the call " +
+            "refuses with no read (fail-closed stale-selection guard)",
+        ),
+      }),
+      execute: async (
+        args: {
+          folder: string;
+          uid: number;
+          filename: string;
+          contentId?: string;
+          index?: number;
+          uidValidity?: number;
+          _client?: ClientFactory;
+          _parseAttachment?: AttachmentExtractor;
+        },
+        context: ExecuteContext,
+      ): Promise<ExecuteResult> => {
+        const folder = args.folder;
+        const uid = args.uid;
+        const cfg = context.globalArgs;
+        const client = (args._client ?? defaultClientFactory)(cfg);
+        const extract = args._parseAttachment ?? extractAttachment;
+        await client.connect();
+
+        // Every record shares these fields; a branch overrides only what it
+        // knows. `index` defaults to the caller-supplied value (or 0) so the
+        // write key is ALWAYS well-formed even on the withheld/not-found
+        // paths, which never decode and so have no resolved index.
+        const base = {
+          folder,
+          uid,
+          filename: args.filename,
+          contentType: null as string | null,
+          contentId: null as string | null,
+          index: args.index ?? 0,
+          size: null as number | null,
+          sourceBytes: 0,
+          sha256: null as string | null,
+          encoding: "base64" as const,
+          content: null as string | null,
+          truncated: false,
+          error: null as string | null,
+        };
+        const write = (rec: Omit<AttachmentBytes, "retrievedAt">) =>
+          context.writeResource(
+            "attachment",
+            `attachment:${folderSlug(folder)}:${uid}:` +
+              `${attachmentSlug(args.filename)}:${rec.index}`,
+            { ...rec, retrievedAt: new Date().toISOString() },
+          );
+
+        try {
+          // EXAMINE (read-only), exactly like fetchMessage -- never a lock.
+          const box = await client.mailboxOpen(folder, { readOnly: true });
+          try {
+            // Fail-closed: an unverifiable guard is a mismatch, not a pass.
+            checkUidValidity(box.uidValidity, args.uidValidity, folder);
+            context.logger.info(
+              "Fetching attachment {filename} of UID {uid} from {folder}",
+              { filename: args.filename, uid, folder },
+            );
+
+            // LAYER 1 -- pre-fetch size gate: {uid,size} only, NO source.
+            let present = false;
+            let serverSize: number | undefined;
+            for await (
+              const msg of client.fetch(
+                String(uid),
+                { uid: true, size: true },
+                { uid: true },
+              )
+            ) {
+              if (msg.uid === uid) {
+                present = true;
+                serverSize = typeof msg.size === "number"
+                  ? msg.size
+                  : undefined;
+              }
+            }
+
+            if (!present) {
+              const handle = await write({
+                ...base,
+                error: `UID ${uid} is not present in ${folder}`,
+              });
+              return { dataHandles: [handle] };
+            }
+
+            // LAYER 1 over-cap: whole-message size known and over the cap --
+            // the source is NEVER fetched, bytes never buffered.
+            if (
+              typeof serverSize === "number" &&
+              serverSize > MAX_ATTACHMENT_BYTES
+            ) {
+              const handle = await write({
+                ...base,
+                sourceBytes: serverSize,
+                truncated: true,
+              });
+              return { dataHandles: [handle] };
+            }
+
+            // FETCH 2 -- source via BODY.PEEK[] (never sets \Seen).
+            let source: Uint8Array | string | undefined;
+            for await (
+              const msg of client.fetch(
+                String(uid),
+                { uid: true, source: true },
+                { uid: true },
+              )
+            ) {
+              if (msg.uid === uid && msg.source !== undefined) {
+                source = msg.source;
+              }
+            }
+
+            if (source === undefined) {
+              // Under-cap but no source returned (expunged/vanished between the
+              // size and source fetch) -- witness it, never a silent null.
+              const handle = await write({
+                ...base,
+                sourceBytes: serverSize ?? 0,
+                error: SOURCE_NOT_RETURNED,
+              });
+              return { dataHandles: [handle] };
+            }
+
+            // LAYER 2 -- post-decode byte cap for the no-server-size path:
+            // withhold (do NOT decode) when the actual source is over the cap.
+            const bytes = sourceByteLength(source);
+            if (bytes > MAX_ATTACHMENT_BYTES) {
+              const handle = await write({
+                ...base,
+                sourceBytes: bytes,
+                truncated: true,
+              });
+              return { dataHandles: [handle] };
+            }
+
+            // UNDER-cap: decode, select, encode. Isolated like fetchMessage --
+            // a malformed/hostile MIME records an error, never crashes.
+            let record: Omit<AttachmentBytes, "retrievedAt">;
+            try {
+              const match = await extract(source, {
+                filename: args.filename,
+                contentId: args.contentId ?? null,
+                index: args.index,
+              });
+              if (!match.found) {
+                record = {
+                  ...base,
+                  sourceBytes: bytes,
+                  error: `no attachment named ${args.filename} in UID ${uid}`,
+                };
+              } else {
+                const content = match.content;
+                record = {
+                  ...base,
+                  contentType: match.mimeType,
+                  contentId: match.contentId,
+                  index: match.index,
+                  size: content.byteLength,
+                  sourceBytes: bytes,
+                  sha256: await sha256Hex(content),
+                  content: encodeBase64(content),
+                };
+              }
+            } catch (err) {
+              record = {
+                ...base,
+                sourceBytes: bytes,
+                error: err instanceof Error ? err.message : String(err),
+              };
+            }
+            const handle = await write(record);
+            return { dataHandles: [handle] };
+          } finally {
+            // Always release the mailbox (CLOSE-safe: EXAMINE never expunges).
+            await client.mailboxClose();
+          }
         } finally {
           await client.logout();
         }
